@@ -8444,6 +8444,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "zisk-zopt"
+version = "1.4.0-alpha"
+dependencies = [
+ "zisk-core",
+ "zisk-transpiler-common",
+]
+
+[[package]]
 name = "ziskclib"
 version = "1.4.0-alpha"
 dependencies = [
