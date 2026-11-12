@@ -5156,6 +5156,7 @@ impl ZiskRom2Asm {
                 ctx.c.is_saved = true;
                 ctx.flag_is_always_zero = true;
             }
+            ZiskOp::KeccakAbsorb => unimplemented!("keccak_absorb is an emulator-only prototype"),
             ZiskOp::Keccak => {
                 // Use the memory address as the first and unique parameter
                 *code += &ctx.full_line_comment("Keccak: rdi = A0".to_string());

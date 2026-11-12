@@ -551,7 +551,9 @@ define_ops! {
     // source words), followed by the loaded words themselves via data_ext_len.
     (JumpDest, "jump_dest", Evm, JUMP_DEST_COST, 0xc0, 8, 0, opc_jump_dest, op_jump_dest, ops_jump_dest),
     (Poseidon2KoalaBear, "poseidon2_koalabear", Poseidon2KoalaBear, POSEIDON2_KOALABEAR_COST, 0xc1, 64, 64, opc_poseidon2_koalabear, op_poseidon2_koalabear, ops_poseidon2_koalabear),
-    // opcodes 0xc2-0xcf are available
+    // Prototype: keccak-f with the rate block at b XORed into the state at a first.
+    (KeccakAbsorb, "keccak_absorb", Keccak, KECCAK_COST, 0xc2, 336, 200, opc_keccak_absorb, op_keccak_absorb, ops_keccak_absorb),
+    // opcodes 0xc3-0xcf are available
 
     (DmaMemCpy, "dma_memcpy", Dma, DMA_MEMCPY_COST, 0xd0, 8, 0, opc_dma_memcpy, op_dma_memcpy, ops_dma_memcpy),
     (DmaMemCmp, "dma_memcmp", Dma, DMA_MEMCMP_COST, 0xd1, 16, 0, opc_dma_memcmp, op_dma_memcmp, ops_dma_memcmp),
@@ -697,6 +699,43 @@ pub fn op_keccak(_a: u64, _b: u64) -> (u64, bool) {
 #[inline(always)]
 pub fn ops_keccak(ctx: &InstContext, stats: &mut dyn OpStats) {
     precompiled_stats_direct_data(ctx, stats, 25, 25);
+}
+
+/// Prototype: XORs the 17-word (136-byte) rate block at address b into the 25-word Keccak state
+/// at address a, runs Keccak-f on the state and stores it back at address a
+#[inline(always)]
+pub fn opc_keccak_absorb(ctx: &mut InstContext) {
+    const WORDS: usize = 25 + 17;
+    let mut data = [0u64; WORDS];
+
+    precompiled_load_ab_data(ctx, 25, 17, &mut data, "keccak_absorb");
+
+    if ctx.emulation_mode != EmulationMode::ConsumeMemReads {
+        let (state_slice, input_slice) = data.split_at_mut(25);
+        let state: &mut [u64; 25] = state_slice.try_into().unwrap();
+        for (s, w) in state.iter_mut().zip(input_slice.iter()) {
+            *s ^= *w;
+        }
+        keccakf(state);
+        for (i, d) in state.iter().enumerate() {
+            ctx.mem.write(ctx.a + (8 * i as u64), *d, 8);
+        }
+    }
+
+    ctx.c = 0;
+    ctx.flag = false;
+}
+
+#[inline(always)]
+pub fn op_keccak_absorb(_a: u64, _b: u64) -> (u64, bool) {
+    unimplemented!("op_keccak_absorb() is not implemented");
+}
+
+/// The plain keccak op charges no memory in the stats (ops_none), so the absorb op charges only
+/// what it adds to it: the reads of the 17-word rate block.
+#[inline(always)]
+pub fn ops_keccak_absorb(ctx: &InstContext, stats: &mut dyn OpStats) {
+    stats.mem_align_read(ctx.b, 17);
 }
 
 /// Performs a Sha256-f hash over the 256-bit state at address a and the 512-bit input block at
