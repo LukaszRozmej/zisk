@@ -80,36 +80,40 @@ struct Rom {
     idx: HashMap<u64, usize>,
 }
 
-fn successors(i: &ZiskInst) -> Option<Vec<u64>> {
+fn successors(i: &ZiskInst) -> Option<([u64; 2], usize)> {
     if i.set_pc {
         return None;
     }
     if i.end {
-        return Some(vec![]);
+        return Some(([0; 2], 0));
     }
     let pc = i.paddr as i64;
     if i.is_precompiled || !is_pure(i) {
         // external ops never raise the flag; j1 may carry an extended argument
-        return Some(vec![(pc + i.jmp_offset2) as u64]);
+        return Some(([(pc + i.jmp_offset2) as u64, 0], 1));
     }
-    let mut v = vec![(pc + i.jmp_offset1) as u64];
-    if i.jmp_offset2 != i.jmp_offset1 {
-        v.push((pc + i.jmp_offset2) as u64);
-    }
-    Some(v)
+    Some((
+        [(pc + i.jmp_offset1) as u64, (pc + i.jmp_offset2) as u64],
+        if i.jmp_offset1 == i.jmp_offset2 { 1 } else { 2 },
+    ))
 }
 
 /// Backward liveness; returns live-out per instruction.
 fn liveness(insts: &BTreeMap<u64, ZiskInstBuilder>, r: &Rom) -> Vec<u64> {
     let n = r.addrs.len();
-    let mut succ: Vec<Option<Vec<usize>>> = Vec::with_capacity(n);
+    let mut succ = Vec::with_capacity(n);
     let mut preds: Vec<Vec<usize>> = vec![vec![]; n];
     for (k, a) in r.addrs.iter().enumerate() {
         let i = &insts[a].i;
-        let s = successors(i)
-            .and_then(|v| v.iter().map(|t| r.idx.get(t).copied()).collect::<Option<Vec<_>>>());
-        if let Some(v) = &s {
-            for &t in v {
+        let s = successors(i).and_then(|(targets, len)| {
+            let mut indices = [0; 2];
+            for j in 0..len {
+                indices[j] = *r.idx.get(&targets[j])?;
+            }
+            Some((indices, len))
+        });
+        if let Some((targets, len)) = &s {
+            for &t in &targets[..*len] {
                 preds[t].push(k);
             }
         }
@@ -125,7 +129,7 @@ fn liveness(insts: &BTreeMap<u64, ZiskInstBuilder>, r: &Rom) -> Vec<u64> {
         queued[k] = false;
         let out = match &succ[k] {
             None => ALL,
-            Some(v) => v.iter().fold(0, |m, &t| m | live_in[t]),
+            Some((targets, len)) => targets[..*len].iter().fold(0, |m, &t| m | live_in[t]),
         };
         live_out[k] = out;
         let inn = rd[k] | (out & !wr[k]);
@@ -286,6 +290,11 @@ fn pass_fold(insts: &mut BTreeMap<u64, ZiskInstBuilder>, cf: bool, af: bool, st:
             }
         } else if af
             && x.op == ZiskOp::ADD
+            // Replacing a must preserve the operation's result and flag, not just its address.
+            && matches!(
+                y.op,
+                ZiskOp::COPYB | ZiskOp::SIGNEXTEND_B | ZiskOp::SIGNEXTEND_H | ZiskOp::SIGNEXTEND_W
+            )
             && x.a_src == SRC_REG
             && x.b_src == SRC_IMM
             && uses_ind_a
@@ -409,4 +418,94 @@ fn main() {
     assert_eq!(back.insts.len(), rom.insts.len());
     std::fs::write(&args[2], out).expect("write");
     eprintln!("wrote {}", args[2]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn instruction(pc: u64, op: &str) -> ZiskInstBuilder {
+        let mut builder = ZiskInstBuilder::default();
+        builder.i.paddr = pc;
+        builder.src_a("imm", 0, false);
+        builder.src_b("imm", 0, false);
+        builder.op(op).unwrap();
+        builder.j(4, 4);
+        builder
+    }
+
+    #[test]
+    fn address_folding_preserves_operation_and_address() {
+        for op in ["copyb", "signextend_b", "signextend_h", "signextend_w", "add", "eq"] {
+            for load in [false, true] {
+                for offset in [-8i64, 8] {
+                    let mut x = instruction(100, "add");
+                    x.src_a("reg", 1, false);
+                    x.src_b("imm", offset as u64, false);
+                    x.store("reg", 2, false, false);
+                    let mut y = instruction(104, op);
+                    y.src_a("reg", 2, false);
+                    if load {
+                        y.src_b("ind", 16, false);
+                        y.store("reg", 3, false, false);
+                    } else {
+                        y.src_b("imm", 0x8000_0080, false);
+                        y.store("ind", 16, false, false);
+                    }
+                    y.ind_width(8);
+                    let original = y.i.clone();
+                    let mut end = instruction(108, "copyb");
+                    end.i.end = true;
+                    let mut insts = BTreeMap::from([(100, x), (104, y), (108, end)]);
+                    let mut stats = Stats::default();
+
+                    pass_fold(&mut insts, false, true, &mut stats);
+
+                    let should_fold = !matches!(op, "add" | "eq");
+                    assert_eq!(stats.af, usize::from(should_fold), "{op}, load={load}");
+                    if should_fold {
+                        let folded = &insts[&100].i;
+                        let base = 1000u64;
+                        let original_a = base.wrapping_add(offset as u64);
+                        let folded_offset =
+                            if load { folded.b_offset_imm0 } else { folded.store_offset as u64 };
+                        assert_eq!(folded.a_offset_imm0, 1);
+                        assert_eq!(base.wrapping_add(folded_offset), original_a + 16);
+                        assert_eq!(
+                            ZiskOp::execute(original.op, original_a, 0x8000_0080),
+                            ZiskOp::execute(folded.op, base, 0x8000_0080)
+                        );
+                    } else {
+                        assert_eq!(insts[&100].i.op, ZiskOp::ADD);
+                        assert_eq!(insts[&100].i.store_offset, 2);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn liveness_preserves_successor_cases() {
+        for (j1, j2, indirect, precompiled, expected) in [
+            (4, 4, false, false, 1 << 1),
+            (4, 8, false, false, (1 << 1) | (1 << 2)),
+            (4, 8, true, false, ALL),
+            (4, 12, false, false, ALL),
+            (12345, 8, false, true, 1 << 2),
+        ] {
+            let mut branch = instruction(100, "eq");
+            branch.j(j1, j2);
+            branch.i.set_pc = indirect;
+            branch.i.is_precompiled = precompiled;
+            let mut left = instruction(104, "copyb");
+            left.src_b("reg", 1, false);
+            left.i.end = true;
+            let mut right = instruction(108, "copyb");
+            right.src_b("reg", 2, false);
+            right.i.end = true;
+            let insts = BTreeMap::from([(100, branch), (104, left), (108, right)]);
+
+            assert_eq!(liveness(&insts, &index(&insts)), vec![expected, 0, 0]);
+        }
+    }
 }
